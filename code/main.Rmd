@@ -1,0 +1,339 @@
+---
+title: 'Immune Modulation Effect of VEGF-A Inhibition with Bevacizumab Combined with
+  PD-L1 Blockade with Avelumab for Recurrent Glioblastoma '
+output:
+  html_document: default
+  pdf_document: default
+date: '2022-06-21'
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(magrittr)
+library(tidyr)
+library(patchwork)
+library(janitor)
+library(survival)
+library(survminer)
+library(DT)
+```
+
+### Load clinical data cleaned
+```{r, warning=F, message=F}
+load("../data/data.RData")
+```
+
+### Survival analysis patient received bevacizumab vs not received bevacizumab
+```{r, warning=F, message=F}
+censored_at <- 540 # 18 months
+
+bldf <- clinical_data%>%
+  group_by(subject_id)%>%
+  arrange(trt_day_from_admission)%>%
+  filter(row_number() == 1)%>%
+  mutate(
+    #----death
+         censored_death_day_from_admission = ifelse(is.na(death_day_from_admission) | (death_day_from_admission > censored_at), censored_at, death_day_from_admission))%>%
+              ungroup()%>%
+  dplyr::select(subject_id, ever_bev, censored_death_day_from_admission, death)%>%
+  ungroup()
+
+
+# death outcome
+fit.one <- survfit(Surv(censored_death_day_from_admission, death == "died") ~ ever_bev, data = bldf, conf.type = "log-log")
+
+```
+
+### Fig 3A
+```{r, warning=F, message=F}
+survminer::ggsurvplot(fit.one, data = bldf, conf.int = T, 
+                      xlab = "Time from Admission",  break.time.by = 30,
+                      ncensor.plot = F, risk.table = T)
+```
+
+### Univariable analysis Olink Cytokine
+
+#### Difference in expression patient received bevacizumab vs not received bevacizumab
+```{r, warning=F, message=F}
+data_use <- cbind(meta_df, olink_df)
+data_use$trt_group <- factor(data_use$trt_group, levels = c("baseline", "ave", "combo"))
+
+#------parametric
+design <- model.matrix( ~ ever_bev, data = data_use )  #  bev  ever_bev
+fit <- limma::lmFit(t(olink_df), design, method = "robust")
+fit <- limma::contrasts.fit(fit, coefficients = ncol(design))
+efit <- limma::eBayes(fit, robust = TRUE)
+#------nonparametric
+rr <- lapply(colnames(olink_df), function(x){
+  
+  temp <- data_use%>%
+    dplyr::select(c(x, "bev", "ever_bev"))%>%
+    mutate(bev = factor(bev))
+  fit <- wilcox.test(get(x) ~ ever_bev, data = temp, paired = F)
+
+  Sum <- temp%>%
+    group_by(bev)%>%
+    summarize(Median = median(get(x), na.rm = T))
+
+  re <- c(x, fit$p.value, Sum[1 , 2], Sum[2 , 2])
+  names(re) <- c("marker", "wilcox_pval", "median_bev_no", "median_bev_yes")
+  
+  unlist(re)
+})
+
+rr <- rr%>%
+  do.call(what = "rbind")%>%
+  data.frame()%>%
+  group_by(marker)%>%
+  mutate_all(as.numeric)%>%
+  ungroup()%>%
+  mutate(adj_wilcox_pval = p.adjust(wilcox_pval, method = "BH")) 
+
+
+```
+
+
+#### Difference in expression patient patient at baseline, avelumab, and combo(avelumab plus bevacizumab)
+```{r, warning=F, message=F}
+rr <- lapply(colnames(olink_df), function(x){
+
+  fit <- aov(get(x) ~ trt_group, data = data_use%>%
+               dplyr::select(x, "trt_group", "subject_id"))
+  anova_pval <- summary(fit)[[1]][["Pr(>F)"]][1]
+  fit_post <- try(summary(glht(fit, linfct = mcp(trt_group = "Tukey"))))
+  fit1 <- kruskal.test(get(x) ~ trt_group, data = data_use)
+  fit1_post<- pairwise.wilcox.test(unlist(data_use[,x]), unlist(data_use[,"trt_group"]), p.adj="none")
+  mediandf <- data_use%>%
+    group_by(trt_group)%>%
+    summarize(median(get(x)))
+  re <- c(x, anova_pval, fit_post$test$coefficients, fit_post$test$pvalues, 
+          fit1$p.value, fit1_post$p.value[1,1], fit1_post$p.value[2,1], fit1_post$p.value[2,2],
+          mediandf[, 2]%>% unlist())
+  names(re) <- c("marker", "pvalue_anova", paste0("coeff_p_", names(fit_post$test$coefficients)), paste0("pvalue_p_", names(fit_post$test$coefficients)), 
+                 "pvalue_kruskal", "pvalue_np_baseline..ave", "pvalue_np_baseline..combo", "pvalue_np_combo..ave",
+                 paste0("median_", mediandf[, 1]%>% unlist()%>% as.character()))
+  
+  re
+})
+
+
+
+rr <- do.call(rbind, rr)%>%
+  data.frame()%>%
+  group_by(marker)%>%
+  mutate_all(as.numeric)%>%
+  ungroup()%>%
+  mutate(adj_pval_anova = p.adjust(pvalue_anova, method = "BH"),
+         adj_pvalue_kruskal = p.adjust(pvalue_kruskal, method = "BH"))
+
+colnames(rr) <- gsub("[\\.]+", "2", colnames(rr))
+
+```
+
+### Table S2
+```{r, warning=F, message=F}
+rr%>%
+  filter(adj_pval_anova <= 0.05)%>%
+  DT::datatable(options = list(scrollX = TRUE))%>%
+  DT::formatRound(columns = colnames(rr)[-1],
+                  digits = 3)
+  
+```
+
+### Fig 3B
+```{r, warning=F, message=F, fig.width=12}
+plot.ls <- lapply(
+  rr%>%filter(adj_pval_anova <= 0.05)%$%marker, function(x){
+  trt_group_td%>%
+    dplyr::select(trt_group, x, subject_id)%>%
+    ggplot()+
+    geom_boxplot(aes(trt_group, get(x), fill = trt_group), alpha = 0.7)+
+    geom_point(aes(trt_group, get(x), color = trt_group), size = 3, position = position_dodge(width = 0.7))+
+    scale_color_manual(values = c("black", "black", "black"))+
+    labs(title = x, x = "", y = "")+
+    theme_bw()
+})
+wrap_plots(plot.ls, nrow = 2) + plot_layout(guides = "collect")
+```
+
+### Univariable analysis Cytof Cellsubtype frequency
+
+#### Difference in expression patient received bevacizumab vs not received bevacizumab child population 
+```{r, warning=F, message=F}
+filt_sample <- apply(cytof_child_df, 1, function(x) sum(is.na(x)) != length(x))
+data_use <- cbind(meta_df, cytof_child_df)[filt_sample, ]
+data_use$trt_group <- factor(data_use$trt_group, levels = c("baseline", "ave", "combo"))
+
+#------parametric
+design <- model.matrix( ~ ever_bev, data = data_use )  #  bev  ever_bev
+fit <- limma::lmFit(t(cytof_child_df)[ , filt_sample], design, method = "robust")
+fit <- limma::contrasts.fit(fit, coefficients = ncol(design))
+efit <- limma::eBayes(fit, robust = TRUE)
+#------nonparametric
+rr <- lapply(colnames(cytof_child_df), function(x){
+  
+  temp <- data_use%>%
+    dplyr::select(c(x, "bev", "ever_bev"))%>%
+    mutate(bev = factor(bev))
+  fit <- wilcox.test(get(x) ~ ever_bev, data = temp, paired = F)
+
+  Sum <- temp%>%
+    group_by(bev)%>%
+    summarize(Median = median(get(x), na.rm = T))
+
+  re <- c(x, fit$p.value, Sum[1 , 2], Sum[2 , 2])
+  names(re) <- c("marker", "wilcox_pval", "median_bev_no", "median_bev_yes")
+  
+  unlist(re)
+})
+
+rr <- rr%>%
+  do.call(what = "rbind")%>%
+  data.frame()%>%
+  group_by(marker)%>%
+  mutate_all(as.numeric)%>%
+  ungroup()%>%
+  mutate(adj_wilcox_pval = p.adjust(wilcox_pval, method = "BH")) 
+
+```
+
+### Fig 3C
+```{r, warning=F, message=F}
+plot.ls <- lapply(rr%>%
+  filter((wilcox_pval <= 0.05))%$%marker, function(x){
+  data_use%>%
+    dplyr::select(ever_bev, x)%>%
+    ggplot()+
+    geom_boxplot(aes(ever_bev, get(x), fill = ever_bev,
+                     ), alpha = 0.7)+
+    geom_point(aes(ever_bev, get(x), color = ever_bev , 
+                   ), size = 3, position = position_dodge(width = 0.7))+
+    scale_color_manual(values = c("black", "black"))+
+    labs(title = x, x = "", y = "")+
+    theme_bw()
+})
+
+wrap_plots(plot.ls, nrow = 1) + plot_layout(guides = "collect")
+```
+
+#### Difference in expression patient patient at baseline, avelumab, and combo(avelumab plus bevacizumab) child population 
+```{r, warning=F, message=F}
+
+rr <- lapply(colnames(cytof_child_df), function(x){
+
+  fit <- aov(get(x) ~ trt_group, data = data_use%>%
+               dplyr::select(x, "trt_group", "subject_id"))
+  anova_pval <- summary(fit)[[1]][["Pr(>F)"]][1]
+  fit_post <- try(summary(glht(fit, linfct = mcp(trt_group = "Tukey"))))
+  fit1 <- kruskal.test(get(x) ~ trt_group, data = data_use)
+  fit1_post<- pairwise.wilcox.test(unlist(data_use[,x]), unlist(data_use[,"trt_group"]), p.adj="none")
+  mediandf <- data_use%>%
+    group_by(trt_group)%>%
+    summarize(median(get(x)))
+  re <- c(x, anova_pval, fit_post$test$coefficients, fit_post$test$pvalues, 
+          fit1$p.value, fit1_post$p.value[1,1], fit1_post$p.value[2,1], fit1_post$p.value[2,2],
+          mediandf[, 2]%>% unlist())
+  names(re) <- c("marker", "pvalue_anova", paste0("coeff_p_", names(fit_post$test$coefficients)), paste0("pvalue_p_", names(fit_post$test$coefficients)), 
+                 "pvalue_kruskal", "pvalue_np_baseline..ave", "pvalue_np_baseline..combo", "pvalue_np_combo..ave",
+                 paste0("median_", mediandf[, 1]%>% unlist()%>% as.character()))
+  
+  re
+})
+
+
+rr <- do.call(rbind, rr)%>%
+  data.frame()%>%
+  group_by(marker)%>%
+  mutate_all(as.numeric)%>%
+  ungroup()%>%
+  mutate(adj_pval_anova = p.adjust(pvalue_anova, method = "BH"),
+         adj_pvalue_kruskal = p.adjust(pvalue_kruskal, method = "BH"))
+
+colnames(rr) <- gsub("[\\.]+", "2", colnames(rr))
+
+```
+
+
+#### Difference in expression patient received bevacizumab vs not received bevacizumab parent population 
+```{r, warning=F, message=F}
+filt_sample <- apply(cytof_parent_df, 1, function(x) sum(is.na(x)) != length(x))
+data_use <- cbind(meta_df, cytof_parent_df)[filt_sample, ]
+data_use$trt_group <- factor(data_use$trt_group, levels = c("baseline", "ave", "combo"))
+
+#------parametric
+design <- model.matrix( ~ ever_bev, data = data_use )  #  bev  ever_bev
+fit <- limma::lmFit(t(cytof_parent_df)[ , filt_sample], design, method = "robust")
+fit <- limma::contrasts.fit(fit, coefficients = ncol(design))
+efit <- limma::eBayes(fit, robust = TRUE)
+
+
+
+#------nonparametric
+rr <- lapply(colnames(cytof_parent_df), function(x){
+  
+  temp <- data_use%>%
+    dplyr::select(c(x, "bev", "ever_bev"))%>%
+    mutate(bev = factor(bev))
+  fit <- wilcox.test(get(x) ~ ever_bev, data = temp, paired = F)
+
+  Sum <- temp%>%
+    group_by(bev)%>%
+    summarize(Median = median(get(x), na.rm = T))
+
+  re <- c(x, fit$p.value, Sum[1 , 2], Sum[2 , 2])
+  names(re) <- c("marker", "wilcox_pval", "median_bev_no", "median_bev_yes")
+  
+  unlist(re)
+})
+
+rr <- rr%>%
+  do.call(what = "rbind")%>%
+  data.frame()%>%
+  group_by(marker)%>%
+  mutate_all(as.numeric)%>%
+  ungroup()%>%
+  mutate(adj_wilcox_pval = p.adjust(wilcox_pval, method = "BH")) 
+
+```
+
+#### Difference in expression patient patient at baseline, avelumab, and combo(avelumab plus bevacizumab) parent population 
+```{r, warning=F, message=F}
+rr <- lapply(colnames(cytof_parent_df), function(x){
+
+  fit <- aov(get(x) ~ trt_group, data = data_use%>%
+               dplyr::select(x, "trt_group", "subject_id"))
+  anova_pval <- summary(fit)[[1]][["Pr(>F)"]][1]
+  fit_post <- try(summary(glht(fit, linfct = mcp(trt_group = "Tukey"))))
+  fit1 <- kruskal.test(get(x) ~ trt_group, data = data_use)
+  fit1_post<- pairwise.wilcox.test(unlist(data_use[,x]), unlist(data_use[,"trt_group"]), p.adj="none")
+  mediandf <- data_use%>%
+    group_by(trt_group)%>%
+    summarize(median(get(x)))
+  re <- c(x, anova_pval, fit_post$test$coefficients, fit_post$test$pvalues, 
+          fit1$p.value, fit1_post$p.value[1,1], fit1_post$p.value[2,1], fit1_post$p.value[2,2],
+          mediandf[, 2]%>% unlist())
+  names(re) <- c("marker", "pvalue_anova", paste0("coeff_p_", names(fit_post$test$coefficients)), paste0("pvalue_p_", names(fit_post$test$coefficients)), 
+                 "pvalue_kruskal", "pvalue_np_baseline..ave", "pvalue_np_baseline..combo", "pvalue_np_combo..ave",
+                 paste0("median_", mediandf[, 1]%>% unlist()%>% as.character()))
+  
+  re
+})
+
+
+rr <- do.call(rbind, rr)%>%
+  data.frame()%>%
+  group_by(marker)%>%
+  mutate_all(as.numeric)%>%
+  ungroup()%>%
+  mutate(adj_pval_anova = p.adjust(pvalue_anova, method = "BH"),
+         adj_pvalue_kruskal = p.adjust(pvalue_kruskal, method = "BH"))
+
+colnames(rr) <- gsub("[\\.]+", "2", colnames(rr))
+
+```
+
+```{r, echo=F, eval=F}
+rmarkdown::render(input = './main.Rmd', output_dir = '../', clean = TRUE, rmarkdown::html_document(pandoc_args = "--self-contained"))
+```
+
